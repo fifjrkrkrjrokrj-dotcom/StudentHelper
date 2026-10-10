@@ -31,7 +31,13 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-PDF_SEMAPHORE = asyncio.Semaphore(2)
+PDF_SEMAPHORE = None
+
+def get_pdf_semaphore():
+    global PDF_SEMAPHORE
+    if PDF_SEMAPHORE is None:
+        PDF_SEMAPHORE = asyncio.Semaphore(2)
+    return PDF_SEMAPHORE
 
 user_image_queues = {}
 user_pdf_states = {}
@@ -301,7 +307,7 @@ async def img2pdf_callback(client: Client, callback_query: CallbackQuery):
         images = user_image_queues[user_id]
         status = await callback_query.message.edit_text(f"⏳ Processing `{len(images)}` images into PDF...")
         
-        async with PDF_SEMAPHORE:
+        async with get_pdf_semaphore():
             with tempfile.TemporaryDirectory() as work:
                 img_paths = []
                 try:
@@ -386,7 +392,7 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
 
     if action == "pdf2img":
         status = await callback_query.message.edit_text("⏳ **Extracting images from PDF...**")
-        async with PDF_SEMAPHORE:
+        async with get_pdf_semaphore():
             with tempfile.TemporaryDirectory() as work:
                 src = os.path.join(work, "input.pdf")
                 try:
