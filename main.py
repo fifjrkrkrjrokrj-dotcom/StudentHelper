@@ -22,7 +22,7 @@ load_dotenv()
 
 API_ID = int(os.getenv("API_ID", "34177205"))
 API_HASH = os.getenv("API_HASH", "fa5c4b5a6dde337c31addb5240e9c205")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8999665775:AAFlIk42x_-F7jx2Gm2cvRipdqQ_xE_sU94")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8949570368:AAHvgxBPnVb6clSBhFi-wG4Zp2bMvIB4S88")
 
 app = Client(
     "StudyHelperBot",
