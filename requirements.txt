@@ -3,3 +3,4 @@ tgcrypto
 pymupdf
 Pillow
 python-dotenv
+motor

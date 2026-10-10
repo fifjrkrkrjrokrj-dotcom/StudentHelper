@@ -16,6 +16,7 @@ from pyrogram.types import (
     InlineKeyboardButton,
     InputMediaPhoto
 )
+from motor.motor_asyncio import AsyncIOMotorClient
 
 # Load environment variables from .env file if it exists
 load_dotenv()
@@ -23,6 +24,7 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID", "34177205"))
 API_HASH = os.getenv("API_HASH", "fa5c4b5a6dde337c31addb5240e9c205")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8949570368:AAHvgxBPnVb6clSBhFi-wG4Zp2bMvIB4S88")
+MONGO_DB_URI = os.getenv("MONGO_DB_URI", "mongodb+srv://clonemusicorginal:clonemusicorginal@cluster0.5j9lfys.mongodb.net/?appName=Cluster0")
 
 app = Client(
     "StudyHelperBot",
@@ -31,6 +33,10 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
+mongo_client = AsyncIOMotorClient(MONGO_DB_URI)
+db = mongo_client["StudyHelperBot"]
+users_col = db["users"]
+
 PDF_SEMAPHORE = None
 
 def get_pdf_semaphore():
@@ -38,9 +44,6 @@ def get_pdf_semaphore():
     if PDF_SEMAPHORE is None:
         PDF_SEMAPHORE = asyncio.Semaphore(2)
     return PDF_SEMAPHORE
-
-user_image_queues = {}
-user_pdf_states = {}
 
 # =========================================================================
 # 📄 UTILS & PDF PROCESSING
@@ -272,11 +275,15 @@ async def start_handler(client: Client, message: Message):
 @app.on_message(filters.photo)
 async def photo_received_handler(client: Client, message: Message):
     user_id = message.from_user.id
-    if user_id not in user_image_queues:
-        user_image_queues[user_id] = []
     
-    user_image_queues[user_id].append(message.photo.file_id)
-    count = len(user_image_queues[user_id])
+    await users_col.update_one(
+        {"_id": user_id},
+        {"$push": {"image_queue": message.photo.file_id}},
+        upsert=True
+    )
+    
+    user_data = await users_col.find_one({"_id": user_id})
+    count = len(user_data.get("image_queue", [])) if user_data else 1
     
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Generate PDF", callback_data="img2pdf:generate")],
@@ -295,16 +302,18 @@ async def img2pdf_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     
     if action == "cancel":
-        if user_id in user_image_queues: del user_image_queues[user_id]
+        await users_col.update_one({"_id": user_id}, {"$set": {"image_queue": []}})
         await callback_query.message.edit_text("❌ Image to PDF conversion cancel kar diya gaya.")
         return
         
     if action == "generate":
-        if user_id not in user_image_queues or not user_image_queues[user_id]:
+        user_data = await users_col.find_one({"_id": user_id})
+        images = user_data.get("image_queue", []) if user_data else []
+        
+        if not images:
             await callback_query.message.edit_text("❌ Koi images nahi hain convert karne ke liye.")
             return
             
-        images = user_image_queues[user_id]
         status = await callback_query.message.edit_text(f"⏳ Processing `{len(images)}` images into PDF...")
         
         async with get_pdf_semaphore():
@@ -322,7 +331,8 @@ async def img2pdf_callback(client: Client, callback_query: CallbackQuery):
                     await client.send_chat_action(callback_query.message.chat.id, enums.ChatAction.UPLOAD_DOCUMENT)
                     await callback_query.message.reply_document(document=out_pdf, file_name="Generated_Notes.pdf", caption="✅ **Yeh lijiye aapki PDF!**")
                     await status.delete()
-                    if user_id in user_image_queues: del user_image_queues[user_id]
+                    
+                    await users_col.update_one({"_id": user_id}, {"$set": {"image_queue": []}})
                 except Exception as e:
                     traceback.print_exc()
                     await status.edit_text(f"❌ Error while generating PDF: `{e}`")
@@ -337,6 +347,12 @@ async def pdf_received_handler(client: Client, message: Message):
     size_mb = (document.file_size or 0) / (1024 * 1024)
     file_name = document.file_name or "document.pdf"
 
+    await users_col.update_one(
+        {"_id": message.from_user.id},
+        {"$set": {"active_pdf_msg_id": message.id}},
+        upsert=True
+    )
+
     await message.reply_text(
         text=f"📁 **PDF Received:** `{file_name}`\n📦 **Size:** `{size_mb:.1f} MB`\n\n👇 **Kya karna chahte hain aap?**",
         reply_markup=get_pdf_options_keyboard(),
@@ -346,16 +362,31 @@ async def pdf_received_handler(client: Client, message: Message):
 @app.on_message(filters.text & ~filters.command("start"))
 async def text_received_handler(client: Client, message: Message):
     user_id = message.from_user.id
-    if user_id in user_pdf_states:
-        state_data = user_pdf_states[user_id]
+    user_data = await users_col.find_one({"_id": user_id})
+    
+    if user_data and user_data.get("awaiting_grid"):
         if message.text.isdigit():
             n = int(message.text)
             if n <= 0 or n > 100:
                 await message.reply_text("❌ Kripya 1 se 100 ke beech ka number dalein.")
                 return
             
-            doc_msg = state_data["doc_msg"]
-            del user_pdf_states[user_id]
+            await users_col.update_one({"_id": user_id}, {"$unset": {"awaiting_grid": ""}})
+            
+            msg_id = user_data.get("active_pdf_msg_id")
+            if not msg_id:
+                await message.reply_text("❌ Koi active PDF session nahi mila. Kripya PDF dobara bhejein.")
+                return
+                
+            try:
+                doc_msg = await client.get_messages(message.chat.id, msg_id)
+            except Exception:
+                doc_msg = None
+                
+            if not doc_msg or not doc_msg.document:
+                await message.reply_text("❌ Original PDF message nahi mila. Kripya PDF dobara bhejein.")
+                return
+            
             layout = f"grid_{n}"
             status_msg = await message.reply_text(f"🎯 **Mode Selected:** `{n}-in-1 Custom Grid`\n📥 **Download shuru ho rahi hai...**")
             await run_pdf_conversion(client, status_msg, doc_msg, layout, f"{n}-in-1 Custom Grid")
@@ -373,18 +404,29 @@ async def menu_handler(client: Client, callback_query: CallbackQuery):
 @app.on_callback_query(filters.regex(r"^cv:"))
 async def callback_handler(client: Client, callback_query: CallbackQuery):
     action = callback_query.data.split(":")[1]
+    user_id = callback_query.from_user.id
 
     if action == "cancel":
         await callback_query.message.edit_text("❌ Action cancelled.")
         return
-
-    doc_msg = callback_query.message.reply_to_message
+        
+    user_data = await users_col.find_one({"_id": user_id})
+    if not user_data or not user_data.get("active_pdf_msg_id"):
+        await callback_query.message.edit_text("❌ Koi active PDF session nahi mila. Kripya PDF dobara bhejein.")
+        return
+        
+    msg_id = user_data.get("active_pdf_msg_id")
+    try:
+        doc_msg = await client.get_messages(callback_query.message.chat.id, msg_id)
+    except Exception:
+        doc_msg = None
+        
     if not doc_msg or not doc_msg.document:
         await callback_query.message.edit_text("❌ Original PDF message nahi mila. Kripya PDF dobara bhejein.")
         return
 
     if action == "custom_grid":
-        user_pdf_states[callback_query.from_user.id] = {"doc_msg": doc_msg}
+        await users_col.update_one({"_id": user_id}, {"$set": {"awaiting_grid": True}})
         await callback_query.message.edit_text("🔢 **Kitne pages 1 sheet pe chahiye?**\n\nNeeche number type karke mujhe bhejein (jaise: 4, 6, 9, 16):")
         return
 
@@ -468,7 +510,7 @@ async def run_pdf_conversion(client, status_msg, doc_msg, layout, selected_title
 
     reporter_task = asyncio.create_task(progress_reporter())
 
-    async with PDF_SEMAPHORE:
+    async with get_pdf_semaphore():
         with tempfile.TemporaryDirectory() as work:
             src = Path(work) / "input.pdf"
             dst = Path(work) / f"{layout}_ready.pdf"
