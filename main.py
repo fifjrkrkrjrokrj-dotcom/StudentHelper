@@ -16,7 +16,6 @@ from pyrogram.types import (
     InlineKeyboardButton,
     InputMediaPhoto
 )
-from motor.motor_asyncio import AsyncIOMotorClient
 
 # Load environment variables from .env file if it exists
 load_dotenv()
@@ -24,7 +23,6 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID", "34177205"))
 API_HASH = os.getenv("API_HASH", "fa5c4b5a6dde337c31addb5240e9c205")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8949570368:AAHvgxBPnVb6clSBhFi-wG4Zp2bMvIB4S88")
-MONGO_DB_URI = os.getenv("MONGO_DB_URI", "mongodb+srv://clonemusicorginal:clonemusicorginal@cluster0.5j9lfys.mongodb.net/?appName=Cluster0")
 
 app = Client(
     "StudyHelperBot",
@@ -33,9 +31,8 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-mongo_client = AsyncIOMotorClient(MONGO_DB_URI)
-db = mongo_client["StudyHelperBot"]
-users_col = db["users"]
+user_image_queues = {}
+user_pdf_states = {}
 
 PDF_SEMAPHORE = None
 
@@ -276,14 +273,11 @@ async def start_handler(client: Client, message: Message):
 async def photo_received_handler(client: Client, message: Message):
     user_id = message.from_user.id
     
-    await users_col.update_one(
-        {"_id": user_id},
-        {"$push": {"image_queue": message.photo.file_id}},
-        upsert=True
-    )
+    if user_id not in user_image_queues:
+        user_image_queues[user_id] = []
     
-    user_data = await users_col.find_one({"_id": user_id})
-    count = len(user_data.get("image_queue", [])) if user_data else 1
+    user_image_queues[user_id].append(message.photo.file_id)
+    count = len(user_image_queues[user_id])
     
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Generate PDF", callback_data="img2pdf:generate")],
@@ -302,14 +296,12 @@ async def img2pdf_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     
     if action == "cancel":
-        await users_col.update_one({"_id": user_id}, {"$set": {"image_queue": []}})
+        user_image_queues[user_id] = []
         await callback_query.message.edit_text("❌ Image to PDF conversion cancel kar diya gaya.")
         return
         
     if action == "generate":
-        user_data = await users_col.find_one({"_id": user_id})
-        images = user_data.get("image_queue", []) if user_data else []
-        
+        images = user_image_queues.get(user_id, [])
         if not images:
             await callback_query.message.edit_text("❌ Koi images nahi hain convert karne ke liye.")
             return
@@ -332,7 +324,7 @@ async def img2pdf_callback(client: Client, callback_query: CallbackQuery):
                     await callback_query.message.reply_document(document=out_pdf, file_name="Generated_Notes.pdf", caption="✅ **Yeh lijiye aapki PDF!**")
                     await status.delete()
                     
-                    await users_col.update_one({"_id": user_id}, {"$set": {"image_queue": []}})
+                    user_image_queues[user_id] = []
                 except Exception as e:
                     traceback.print_exc()
                     await status.edit_text(f"❌ Error while generating PDF: `{e}`")
@@ -346,12 +338,11 @@ async def pdf_received_handler(client: Client, message: Message):
 
     size_mb = (document.file_size or 0) / (1024 * 1024)
     file_name = document.file_name or "document.pdf"
-
-    await users_col.update_one(
-        {"_id": message.from_user.id},
-        {"$set": {"active_pdf_msg_id": message.id}},
-        upsert=True
-    )
+    
+    if message.from_user.id not in user_pdf_states:
+        user_pdf_states[message.from_user.id] = {}
+        
+    user_pdf_states[message.from_user.id]["message_id"] = message.id
 
     await message.reply_text(
         text=f"📁 **PDF Received:** `{file_name}`\n📦 **Size:** `{size_mb:.1f} MB`\n\n👇 **Kya karna chahte hain aap?**",
@@ -362,18 +353,17 @@ async def pdf_received_handler(client: Client, message: Message):
 @app.on_message(filters.text & ~filters.command("start"))
 async def text_received_handler(client: Client, message: Message):
     user_id = message.from_user.id
-    user_data = await users_col.find_one({"_id": user_id})
     
-    if user_data and user_data.get("awaiting_grid"):
+    if user_id in user_pdf_states and user_pdf_states[user_id].get("awaiting_grid"):
         if message.text.isdigit():
             n = int(message.text)
             if n <= 0 or n > 100:
                 await message.reply_text("❌ Kripya 1 se 100 ke beech ka number dalein.")
                 return
             
-            await users_col.update_one({"_id": user_id}, {"$unset": {"awaiting_grid": ""}})
+            user_pdf_states[user_id]["awaiting_grid"] = False
             
-            msg_id = user_data.get("active_pdf_msg_id")
+            msg_id = user_pdf_states[user_id].get("message_id")
             if not msg_id:
                 await message.reply_text("❌ Koi active PDF session nahi mila. Kripya PDF dobara bhejein.")
                 return
@@ -410,12 +400,12 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
         await callback_query.message.edit_text("❌ Action cancelled.")
         return
         
-    user_data = await users_col.find_one({"_id": user_id})
-    if not user_data or not user_data.get("active_pdf_msg_id"):
+    user_state = user_pdf_states.get(user_id, {})
+    if not user_state or not user_state.get("message_id"):
         await callback_query.message.edit_text("❌ Koi active PDF session nahi mila. Kripya PDF dobara bhejein.")
         return
         
-    msg_id = user_data.get("active_pdf_msg_id")
+    msg_id = user_state.get("message_id")
     try:
         doc_msg = await client.get_messages(callback_query.message.chat.id, msg_id)
     except Exception:
@@ -426,7 +416,7 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
         return
 
     if action == "custom_grid":
-        await users_col.update_one({"_id": user_id}, {"$set": {"awaiting_grid": True}})
+        user_pdf_states[user_id]["awaiting_grid"] = True
         await callback_query.message.edit_text("🔢 **Kitne pages 1 sheet pe chahiye?**\n\nNeeche number type karke mujhe bhejein (jaise: 4, 6, 9, 16):")
         return
 
